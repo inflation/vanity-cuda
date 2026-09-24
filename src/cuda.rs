@@ -107,6 +107,8 @@ struct Gpu {
 impl Gpu {
     fn new() -> Result<Gpu, Box<dyn Error>> {
         let cu = CudaContext::new(0)?;
+        // Sleep instead of spinning a core while waiting for each launch.
+        cu.set_blocking_synchronize()?;
         let module = cu.load_module(Ptx::from_src(PTX))?;
         let sms = cu.attribute(CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)? as u32;
         Ok(Gpu {
