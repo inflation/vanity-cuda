@@ -4,6 +4,7 @@
 // build.rs reads these values for src/cuda.rs.
 // Table points per batch; each thread checks 2 * BATCH + 1 keys per iteration.
 #define BATCH 128
+#define BLOCK 128
 #define BLOCKS_PER_SM 6
 
 struct fe {
@@ -19,7 +20,7 @@ __device__ __forceinline__ fe fe_one() {
 __device__ __forceinline__ void fold(fe &r, uint32_t c) {
     uint32_t c2;
     asm("mad.lo.cc.u32 %0, %9, 38, %0;\n\t"
-        "madc.hi.cc.u32 %1, %9, 38, %1;\n\t"
+        "addc.cc.u32 %1, %1, 0;\n\t"
         "addc.cc.u32 %2, %2, 0;\n\t"
         "addc.cc.u32 %3, %3, 0;\n\t"
         "addc.cc.u32 %4, %4, 0;\n\t"
@@ -342,6 +343,42 @@ __device__ fe fe_invert(const fe &x) {
     return normalize(d, f.v[8]);
 }
 
+__device__ __forceinline__ fe shfl(const fe &a, int lane) {
+    fe r;
+    for (int i = 0; i < 8; i++) r.v[i] = __shfl_sync(0xffffffff, a.v[i], lane);
+    return r;
+}
+
+// Inverse of every thread's a with one inversion per block: 1/a_t = (a_0 ... a_(t-1)) (a_(t+1) ... a_last) / total.
+// Warps scan prefix and suffix products with shuffles; warp 0 combines the warp totals and inverts.
+__device__ __forceinline__ fe block_invert(const fe &a) {
+    constexpr int WARPS = BLOCK / 32;
+    __shared__ fe tot[WARPS], scale[WARPS];
+    int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    fe p = a, q = a;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+        fe x = shfl(p, lane - o), y = shfl(q, lane + o);
+        p = fe_mul(p, lane >= o ? x : fe_one());
+        q = fe_mul(q, lane + o < 32 ? y : fe_one());
+    }
+    if (lane == 31) tot[w] = p;
+    __syncthreads();
+    if (w == 0) {
+        fe pre[WARPS], suf = fe_one();
+        pre[0] = fe_one();
+        for (int k = 1; k < WARPS; k++) pre[k] = fe_mul(pre[k - 1], tot[k - 1]);
+        fe inv = fe_invert(fe_mul(pre[WARPS - 1], tot[WARPS - 1]));
+        for (int k = WARPS - 1; k >= 0; k--) {
+            if (lane == k) scale[k] = fe_mul(fe_mul(pre[k], suf), inv);
+            suf = fe_mul(suf, tot[k]);
+        }
+    }
+    __syncthreads();
+    fe pe = shfl(p, lane - 1), qe = shfl(q, lane + 1);
+    return fe_mul(fe_mul(lane > 0 ? pe : fe_one(), lane < 31 ? qe : fe_one()), scale[w]);
+}
+
 // First 8 bytes of the canonical encoding, as a big-endian integer.
 __device__ __forceinline__ uint64_t fe_prefix(const fe &x) {
     fe a = fe_canonical(x);
@@ -480,7 +517,7 @@ __device__ __forceinline__ void walk_body(uint32_t *state, const uint32_t *__res
             acc[i] = a;
             a = fe_mul(a, fe_sub(entry(table, i, 0), cu));
         }
-        fe inv = fe_invert(a);
+        fe inv = block_invert(a);
         fe su = entry(table, BATCH, 0);
         fe inv_s = fe_mul(inv, acc[BATCH]);
         inv = fe_mul(inv, fe_sub(su, cu));
@@ -522,14 +559,14 @@ __device__ __forceinline__ Matcher matcher(const uint64_t *masks, const uint32_t
     return m;
 }
 
-extern "C" __global__ void __launch_bounds__(128, BLOCKS_PER_SM)
+extern "C" __global__ void __launch_bounds__(BLOCK, BLOCKS_PER_SM)
     walk(uint32_t *state, const uint32_t *__restrict__ table, const uint64_t *masks, const uint32_t *starts,
          const uint64_t *values, uint32_t groups, const uint64_t *chars, uint32_t *hits, uint32_t max_hits,
          uint32_t iters) {
     walk_body<false>(state, table, matcher(masks, starts, values, groups, chars, hits, max_hits), iters);
 }
 
-extern "C" __global__ void __launch_bounds__(128, BLOCKS_PER_SM)
+extern "C" __global__ void __launch_bounds__(BLOCK, BLOCKS_PER_SM)
     walk_fast(uint32_t *state, const uint32_t *__restrict__ table, const uint64_t *masks, const uint32_t *starts,
               const uint64_t *values, uint32_t groups, const uint64_t *chars, uint32_t *hits, uint32_t max_hits,
               uint32_t iters) {

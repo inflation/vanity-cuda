@@ -12,7 +12,7 @@ const BATCH: usize = define(env!("VANITY_BATCH"));
 const BLOCKS_PER_SM: u32 = define(env!("VANITY_BLOCKS_PER_SM")) as u32;
 /// Keys each thread checks per iteration: its center and center ± i R for i in 1..=BATCH.
 const KEYS: u64 = 2 * BATCH as u64 + 1;
-const BLOCK: u32 = 128;
+const BLOCK: u32 = define(env!("VANITY_BLOCK")) as u32;
 /// About 4096 keys per thread per launch keeps launches short and stop requests responsive.
 const ITERS: u32 = 1 + 4095 / KEYS as u32;
 const MAX_HITS: u32 = 1024;

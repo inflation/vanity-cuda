@@ -7,7 +7,7 @@ fn main() {
     println!("cargo:rerun-if-changed={KERNEL}");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     let src = std::fs::read_to_string(KERNEL).unwrap();
-    for name in ["BATCH", "BLOCKS_PER_SM"] {
+    for name in ["BATCH", "BLOCK", "BLOCKS_PER_SM"] {
         let value = src
             .lines()
             .find_map(|l| l.strip_prefix(&format!("#define {name} ")))
