@@ -59,10 +59,8 @@ fn main() -> Result<()> {
             if let Ok(hit) = rx.recv_timeout(tick.saturating_sub(last.0.elapsed())) {
                 let private = Zeroizing::new(STANDARD.encode(*hit.private));
                 bar.suspend(|| {
-                    if found > 0 {
-                        println!("{}", "-".repeat(53));
-                    }
                     println!("private: {}\npublic:  {}", *private, STANDARD.encode(hit.public));
+                    println!("{}", "-".repeat(53));
                 });
                 found += 1;
             }
