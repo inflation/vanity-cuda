@@ -263,18 +263,50 @@ __device__ __forceinline__ fe entry(const uint32_t *__restrict__ table, int i, i
     return {{lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w}};
 }
 
-// For each i, writes mul, add, sub, invert, sqr of a[i], b[i] (8 words each) and the prefix (2 words).
+// Low 64 bits of X_lo + 38 X_hi for X = a^2 = X_lo + 2^256 X_hi, which only needs product columns 0..9.
+__device__ __forceinline__ uint64_t sqr_low(const fe &a) {
+    uint32_t r[10] = {0};
+#pragma unroll
+    for (int i = 0; i < 5; i++) {
+        uint64_t c = 0;
+#pragma unroll
+        for (int j = i + 1; j < 8 && i + j < 10; j++) {
+            uint64_t t = (uint64_t)a.v[i] * a.v[j] + r[i + j] + c;
+            r[i + j] = (uint32_t)t;
+            c = t >> 32;
+        }
+        if (i < 2) r[i + 8] = (uint32_t)c;
+    }
+#pragma unroll
+    for (int k = 9; k > 0; k--) r[k] = r[k] << 1 | r[k - 1] >> 31;
+    uint64_t c = 0;
+#pragma unroll
+    for (int i = 0; i < 5; i++) {
+        uint64_t t = (uint64_t)a.v[i] * a.v[i] + r[2 * i] + c;
+        r[2 * i] = (uint32_t)t;
+        t = (t >> 32) + r[2 * i + 1];
+        r[2 * i + 1] = (uint32_t)t;
+        c = t >> 32;
+    }
+    return ((uint64_t)r[1] << 32 | r[0]) + 38 * ((uint64_t)r[9] << 32 | r[8]);
+}
+
+__device__ __forceinline__ uint64_t lo64(const fe &a) { return (uint64_t)a.v[1] << 32 | a.v[0]; }
+
+// For each i, writes mul, add, sub, invert, sqr of a[i], b[i] (8 words each), the prefix and sqr_low (2 words each).
 extern "C" __global__ void field_test(const uint32_t *a, const uint32_t *b, uint32_t *out, uint32_t n) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     fe x, y;
     for (int k = 0; k < 8; k++) x.v[k] = a[8 * i + k], y.v[k] = b[8 * i + k];
     fe r[5] = {fe_mul(x, y), fe_add(x, y), fe_sub(x, y), fe_invert(x), fe_sqr(x)};
-    uint32_t *o = out + 42 * i;
+    uint32_t *o = out + 44 * i;
     for (int j = 0; j < 5; j++)
         for (int k = 0; k < 8; k++) o[8 * j + k] = r[j].v[k];
     uint64_t p = fe_prefix(x);
     o[40] = (uint32_t)(p >> 32), o[41] = (uint32_t)p;
+    uint64_t l = sqr_low(x);
+    o[42] = (uint32_t)l, o[43] = (uint32_t)(l >> 32);
 }
 
 struct Matcher {
@@ -282,7 +314,7 @@ struct Matcher {
     const uint32_t *starts;
     const uint64_t *values;
     uint32_t groups;
-    uint64_t first_chars, second_chars;
+    uint64_t chars[6];
     uint32_t *hits;
     uint32_t max_hits;
 };
@@ -291,11 +323,10 @@ struct Matcher {
 // The prefix filter assumes u mod p = u - p * (u >> 255), which only fails for u in [p, 2^255) or
 // u >= 2p (probability ~2^-250); matches are confirmed with the exact prefix.
 __device__ __forceinline__ void check(const Matcher &m, const fe &u, uint32_t tid, uint32_t j, uint32_t it) {
-    uint64_t lo = ((uint64_t)u.v[1] << 32 | u.v[0]) + 19 * (u.v[7] >> 31);
+    uint64_t lo = lo64(u) + 19 * (u.v[7] >> 31);
     uint64_t p = (uint64_t)__byte_perm((uint32_t)lo, 0, 0x0123) << 32 | __byte_perm((uint32_t)(lo >> 32), 0, 0x0123);
-    bool maybe = m.first_chars >> (p >> 58) & m.second_chars >> (p >> 52 & 63) & 1;
-    if (maybe && matches(m.masks, m.starts, m.values, m.groups, p) &&
-        fe_prefix(u) == p) {
+    bool maybe = m.chars[0] >> (p >> 58) & m.chars[1] >> (p >> 52 & 63) & 1;
+    if (maybe && matches(m.masks, m.starts, m.values, m.groups, p) && fe_prefix(u) == p) {
         uint32_t k = atomicAdd(m.hits, 1);
         if (k < m.max_hits) {
             uint32_t *h = m.hits + 1 + 5 * k;
@@ -304,16 +335,30 @@ __device__ __forceinline__ void check(const Matcher &m, const fe &u, uint32_t ti
     }
 }
 
-// Each thread holds a center C and checks u(C + (j - BATCH) R) for j in 0..=2 BATCH, where
-// table entry i < BATCH is (i + 1) R and entry BATCH is the center step (2 BATCH + 1) R.
+// l is the low 64 bits of an unreduced u' = u + k p with k in [-5, 78], so the low 64 bits of u are
+// l + 19 k and bits 16.. differ from those of l by -1, 0 or 1. Characters 3..5 of the key live in
+// those bits (little-endian bits 16..21, 26..31 and 24..25 + 36..39), so this test never misses.
+__device__ __forceinline__ bool maybe_fast(const Matcher &m, uint64_t l) {
+    uint64_t h = l >> 16;
+    bool any = false;
+#pragma unroll
+    for (int c = -1; c <= 1; c++) {
+        uint64_t x = h + c;
+        uint32_t c3 = x & 63, c4 = x >> 10 & 63, c5 = (x >> 8 & 3) << 4 | (x >> 20 & 15);
+        any |= m.chars[3] >> c3 & m.chars[4] >> c4 & m.chars[5] >> c5 & 1;
+    }
+    return any;
+}
+
+// Each thread holds a center C and checks u(C + (j - BATCH) G) for j in 0..=2 BATCH, where
+// table entry i < BATCH is (i + 1) G and entry BATCH is the center step (2 BATCH + 1) G.
 // On v^2 = u^3 + A u^2 + u, u(C +- P) = lambda^2 - A - uC - uP with lambda = (+-vP - vC) / (uP - uC),
 // so both signs share one inverse, and all inverses of a thread share one batch inversion.
-extern "C" __global__ void __launch_bounds__(128, BLOCKS_PER_SM)
-    walk(uint32_t *state, const uint32_t *__restrict__ table, const uint64_t *masks, const uint32_t *starts,
-         const uint64_t *values, uint32_t groups, uint64_t first_chars, uint64_t second_chars,
-         uint32_t *hits, uint32_t max_hits, uint32_t iters) {
+// FAST (every prefix has at least 5 characters) first filters on the low 64 bits of u.
+template <bool FAST>
+__device__ __forceinline__ void walk_body(uint32_t *state, const uint32_t *__restrict__ table, const Matcher &m,
+                                          uint32_t iters) {
     uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    Matcher m = {masks, starts, values, groups, first_chars, second_chars, hits, max_hits};
     fe cu = load(state, 0, tid), cv = load(state, 1, tid), acc[BATCH + 1];
     const fe a_coef = {{486662, 0, 0, 0, 0, 0, 0, 0}};
     for (uint32_t it = 0; it < iters; it++) {
@@ -334,10 +379,18 @@ extern "C" __global__ void __launch_bounds__(128, BLOCKS_PER_SM)
             fe ru = entry(table, i, 0), rv = entry(table, i, 1);
             fe di = fe_mul(inv, acc[i]);
             inv = fe_mul(inv, fe_sub(ru, cu));
-            fe base = fe_add(a_cu, ru);
             fe lp = fe_mul(fe_sub(rv, cv), di), lm = fe_mul(fe_add(rv, cv), di);
-            check(m, fe_sub(fe_sqr(lp), base), tid, BATCH + 1 + i, it);
-            check(m, fe_sub(fe_sqr(lm), base), tid, BATCH - 1 - i, it);
+            if (FAST) {
+                uint64_t base = lo64(a_cu) + lo64(ru);
+                if (maybe_fast(m, sqr_low(lp) - base))
+                    check(m, fe_sub(fe_sqr(lp), fe_add(a_cu, ru)), tid, BATCH + 1 + i, it);
+                if (maybe_fast(m, sqr_low(lm) - base))
+                    check(m, fe_sub(fe_sqr(lm), fe_add(a_cu, ru)), tid, BATCH - 1 - i, it);
+            } else {
+                fe base = fe_add(a_cu, ru);
+                check(m, fe_sub(fe_sqr(lp), base), tid, BATCH + 1 + i, it);
+                check(m, fe_sub(fe_sqr(lm), base), tid, BATCH - 1 - i, it);
+            }
         }
         fe lambda = fe_mul(fe_sub(entry(table, BATCH, 1), cv), inv_s);
         fe nu = fe_sub(fe_sub(fe_sqr(lambda), a_cu), su);
@@ -346,4 +399,26 @@ extern "C" __global__ void __launch_bounds__(128, BLOCKS_PER_SM)
     }
     store(state, 0, tid, cu);
     store(state, 1, tid, cv);
+}
+
+__device__ __forceinline__ Matcher matcher(const uint64_t *masks, const uint32_t *starts, const uint64_t *values,
+                                           uint32_t groups, const uint64_t *chars, uint32_t *hits,
+                                           uint32_t max_hits) {
+    Matcher m = {masks, starts, values, groups, {}, hits, max_hits};
+    for (int i = 0; i < 6; i++) m.chars[i] = chars[i];
+    return m;
+}
+
+extern "C" __global__ void __launch_bounds__(128, BLOCKS_PER_SM)
+    walk(uint32_t *state, const uint32_t *__restrict__ table, const uint64_t *masks, const uint32_t *starts,
+         const uint64_t *values, uint32_t groups, const uint64_t *chars, uint32_t *hits, uint32_t max_hits,
+         uint32_t iters) {
+    walk_body<false>(state, table, matcher(masks, starts, values, groups, chars, hits, max_hits), iters);
+}
+
+extern "C" __global__ void __launch_bounds__(128, BLOCKS_PER_SM)
+    walk_fast(uint32_t *state, const uint32_t *__restrict__ table, const uint64_t *masks, const uint32_t *starts,
+              const uint64_t *values, uint32_t groups, const uint64_t *chars, uint32_t *hits, uint32_t max_hits,
+              uint32_t iters) {
+    walk_body<true>(state, table, matcher(masks, starts, values, groups, chars, hits, max_hits), iters);
 }

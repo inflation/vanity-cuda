@@ -100,6 +100,7 @@ impl Lane {
 struct Gpu {
     stream: Arc<CudaStream>,
     walk: CudaFunction,
+    walk_fast: CudaFunction,
     blocks: u32,
 }
 
@@ -111,6 +112,7 @@ impl Gpu {
         Ok(Gpu {
             stream: cu.default_stream(),
             walk: module.load_function("walk")?,
+            walk_fast: module.load_function("walk_fast")?,
             blocks: sms * BLOCKS_PER_SM,
         })
     }
@@ -157,7 +159,9 @@ fn search(ctx: &Ctx, o: Orientation, lanes: Receiver<Lane>) -> Result<(), Box<dy
         .collect();
     let (values, starts) = (stream.clone_htod(&values)?, stream.clone_htod(&starts)?);
     let (n_groups, max_hits, iters) = (groups.len() as u32, MAX_HITS, ITERS);
-    let [first_chars, second_chars] = ctx.matcher.char_sets();
+    let chars = stream.clone_htod(&ctx.matcher.char_sets())?;
+    // The fast kernel filters on characters 3..5, so every pattern must have them.
+    let walk = if ctx.matcher.min_len() >= 5 { &gpu.walk_fast } else { &gpu.walk };
     let mut hits = stream.alloc_zeros::<u32>(1 + 5 * MAX_HITS as usize)?;
     let cfg = LaunchConfig {
         grid_dim: (gpu.blocks, 1, 1),
@@ -174,15 +178,14 @@ fn search(ctx: &Ctx, o: Orientation, lanes: Receiver<Lane>) -> Result<(), Box<dy
         if ctx.done() {
             break;
         }
-        let mut b = stream.launch_builder(&gpu.walk);
+        let mut b = stream.launch_builder(walk);
         b.arg(&mut state)
             .arg(&table)
             .arg(&masks)
             .arg(&starts)
             .arg(&values)
             .arg(&n_groups)
-            .arg(&first_chars)
-            .arg(&second_chars);
+            .arg(&chars);
         b.arg(&mut hits).arg(&max_hits).arg(&iters);
         unsafe { b.launch(cfg) }?;
         let h = stream.clone_dtoh(&hits)?;
@@ -279,7 +282,7 @@ mod tests {
             gpu.stream.clone_htod(a).unwrap(),
             gpu.stream.clone_htod(b).unwrap(),
         );
-        let mut out = gpu.stream.alloc_zeros::<u32>(42 * n as usize).unwrap();
+        let mut out = gpu.stream.alloc_zeros::<u32>(44 * n as usize).unwrap();
         let mut l = gpu.stream.launch_builder(&f);
         l.arg(&da).arg(&db).arg(&mut out).arg(&n);
         let cfg = LaunchConfig {
@@ -294,7 +297,7 @@ mod tests {
                 from_words(&a[8 * i..8 * i + 8]),
                 from_words(&b[8 * i..8 * i + 8]),
             );
-            let o = &out[42 * i..42 * i + 42];
+            let o = &out[44 * i..44 * i + 44];
             assert_eq!(
                 from_words(&o[..8]).to_bytes(),
                 x.mul(y).to_bytes(),
@@ -327,11 +330,31 @@ mod tests {
                 x.prefix(),
                 "prefix {i}"
             );
+            assert_eq!(
+                (o[43] as u64) << 32 | o[42] as u64,
+                sqr_low(&a[8 * i..8 * i + 8]),
+                "sqr_low {i}"
+            );
         }
     }
 
-    #[test]
-    fn walk_matches_dalek() {
+    /// Low 64 bits of lo + 38 hi for the 512-bit square lo + 2^256 hi of the words `w`.
+    fn sqr_low(w: &[u32]) -> u64 {
+        let mut x = [0u64; 16];
+        for i in 0..8 {
+            let mut c = 0u64;
+            for j in 0..8 {
+                let t = w[i] as u64 * w[j] as u64 + x[i + j] + c;
+                x[i + j] = t & 0xffffffff;
+                c = t >> 32;
+            }
+            x[i + 8] = c;
+        }
+        (x[1] << 32 | x[0]).wrapping_add(38u64.wrapping_mul(x[9] << 32 | x[8]))
+    }
+
+    /// Runs `iters` iterations on 256 threads and checks every hit and the final centers with dalek.
+    fn walk_matches_dalek(fast: bool, m: crate::pattern::Matcher, iters: u32, min_hits: u32) {
         let gpu = Gpu::new().unwrap();
         let stream = &gpu.stream;
         let (blocks, threads) = (2u32, 2 * BLOCK as usize);
@@ -340,29 +363,30 @@ mod tests {
         let centers: Vec<u32> = lanes.iter().flat_map(|l| l.center).collect();
         let mut state = stream.clone_htod(&centers).unwrap();
         let table = stream.clone_htod(&build_table(o)).unwrap();
-        let m = crate::pattern::Matcher::new(&["A".into(), "wg".into()], false).unwrap();
         let masks = stream
             .clone_htod(&m.groups.iter().map(|g| g.0).collect::<Vec<_>>())
             .unwrap();
         let values: Vec<u64> = m.groups.iter().flat_map(|g| g.1.clone()).collect();
-        let starts = stream
-            .clone_htod(&[0, m.groups[0].1.len() as u32, values.len() as u32])
-            .unwrap();
+        let starts: Vec<u32> = std::iter::once(0)
+            .chain(m.groups.iter().scan(0, |n, g| {
+                *n += g.1.len() as u32;
+                Some(*n)
+            }))
+            .collect();
+        let starts = stream.clone_htod(&starts).unwrap();
         let values = stream.clone_htod(&values).unwrap();
-        let (groups, iters) = (2u32, 3u32);
-        let [first_chars, second_chars] = m.char_sets();
-        let expect = threads as u64 * KEYS * iters as u64 / 64;
-        let max_hits = 2 * expect as u32;
+        let chars = stream.clone_htod(&m.char_sets()).unwrap();
+        let groups = m.groups.len() as u32;
+        let max_hits = 4 * min_hits + 64;
         let mut hits = stream.alloc_zeros::<u32>(1 + 5 * max_hits as usize).unwrap();
-        let mut b = stream.launch_builder(&gpu.walk);
+        let mut b = stream.launch_builder(if fast { &gpu.walk_fast } else { &gpu.walk });
         b.arg(&mut state)
             .arg(&table)
             .arg(&masks)
             .arg(&starts)
             .arg(&values)
             .arg(&groups)
-            .arg(&first_chars)
-            .arg(&second_chars);
+            .arg(&chars);
         b.arg(&mut hits).arg(&max_hits).arg(&iters);
         let cfg = LaunchConfig {
             grid_dim: (blocks, 1, 1),
@@ -372,7 +396,7 @@ mod tests {
         unsafe { b.launch(cfg) }.unwrap();
 
         let h = stream.clone_dtoh(&hits).unwrap();
-        assert!(h[0] as u64 > expect / 2 && h[0] <= max_hits, "hits: {}", h[0]);
+        assert!(h[0] >= min_hits && h[0] <= max_hits, "hits: {}", h[0]);
         let mut sides = [false; 2];
         for r in h[1..].as_chunks::<5>().0.iter().take(h[0] as usize) {
             let seed = &lanes[r[0] as usize].seed;
@@ -385,14 +409,37 @@ mod tests {
         assert_eq!(sides, [true; 2]);
 
         let s = stream.clone_dtoh(&state).unwrap();
-        let get = |c: usize, tid: usize| {
-            from_words(&s[tid * 16 + c * 8..tid * 16 + c * 8 + 8])
-        };
+        let get = |c: usize, tid: usize| from_words(&s[tid * 16 + c * 8..tid * 16 + c * 8 + 8]);
         for tid in [0, 17, threads - 1] {
             let p = (get(0, tid), get(1, tid));
             let center = iters as u64 * KEYS + BATCH as u64;
             assert_eq!(p.0.to_bytes(), u_of(&lanes[tid].seed, center));
             assert!(on_curve(p));
         }
+    }
+
+    #[test]
+    fn walk_exact() {
+        let m = crate::pattern::Matcher::new(&["A".into(), "wg".into()], false).unwrap();
+        let expect = 2 * BLOCK * KEYS as u32 * 3 / 64;
+        walk_matches_dalek(false, m, 3, expect * 3 / 4);
+    }
+
+    /// Prefixes "???AA": 2^18 patterns of 30 bits, so hits are frequent while the fast filter
+    /// on characters 3..5 stays selective.
+    #[test]
+    fn walk_fast() {
+        let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".as_bytes();
+        let prefixes: Vec<String> = (0..1 << 18)
+            .map(|n: usize| {
+                let c = |k: usize| alphabet[n >> (6 * k) & 63] as char;
+                format!("{}{}{}AA", c(0), c(1), c(2))
+            })
+            .collect();
+        let m = crate::pattern::Matcher::new(&prefixes, false).unwrap();
+        assert_eq!(m.min_len(), 5);
+        let iters = 4;
+        let expect = 2 * BLOCK * KEYS as u32 * iters / 4096;
+        walk_matches_dalek(true, m, iters, expect * 3 / 4);
     }
 }
