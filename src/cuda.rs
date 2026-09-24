@@ -330,11 +330,9 @@ mod tests {
                 x.prefix(),
                 "prefix {i}"
             );
-            assert_eq!(
-                (o[43] as u64) << 32 | o[42] as u64,
-                sqr_low(&a[8 * i..8 * i + 8]),
-                "sqr_low {i}"
-            );
+            let approx = (o[43] as u64) << 32 | o[42] as u64;
+            let e = sqr_low(&a[8 * i..8 * i + 8]).wrapping_sub(approx);
+            assert!(e.is_multiple_of(38) && e / 38 <= 16, "sqr_low {i}: off by {e}");
         }
     }
 
@@ -425,21 +423,22 @@ mod tests {
         walk_matches_dalek(false, m, 3, expect * 3 / 4);
     }
 
-    /// Prefixes "???AA": 2^18 patterns of 30 bits, so hits are frequent while the fast filter
-    /// on characters 3..5 stays selective.
+    /// Prefixes "???AA" and "???gA": 2^19 patterns of 30 bits, so hits are frequent while the fast
+    /// filter on characters 3..5 stays selective. 'A' (0) takes the wrap-around path and 'g' (32)
+    /// the single evaluation.
     #[test]
     fn walk_fast() {
         let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".as_bytes();
         let prefixes: Vec<String> = (0..1 << 18)
-            .map(|n: usize| {
+            .flat_map(|n: usize| {
                 let c = |k: usize| alphabet[n >> (6 * k) & 63] as char;
-                format!("{}{}{}AA", c(0), c(1), c(2))
+                ["AA", "gA"].map(|t| format!("{}{}{}{t}", c(0), c(1), c(2)))
             })
             .collect();
         let m = crate::pattern::Matcher::new(&prefixes, false).unwrap();
         assert_eq!(m.min_len(), 5);
         let iters = 4;
-        let expect = 2 * BLOCK * KEYS as u32 * iters / 4096;
+        let expect = 2 * BLOCK * KEYS as u32 * iters / 2048;
         walk_matches_dalek(true, m, iters, expect * 3 / 4);
     }
 }

@@ -263,32 +263,18 @@ __device__ __forceinline__ fe entry(const uint32_t *__restrict__ table, int i, i
     return {{lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w}};
 }
 
-// Low 64 bits of X_lo + 38 X_hi for X = a^2 = X_lo + 2^256 X_hi, which only needs product columns 0..9.
+// Low 64 bits of X_lo + 38 X_hi' for X = a^2 = X_lo + 2^256 X_hi, where X_hi' = X_hi - e with
+// e in [0, 16]: columns 0..6 and the low halves of column 7 carry at most 7 + 8 into X_hi, so they
+// are skipped, and columns 8 and 9 are only needed mod 2^64 and mod 2^32.
 __device__ __forceinline__ uint64_t sqr_low(const fe &a) {
-    uint32_t r[10] = {0};
-#pragma unroll
-    for (int i = 0; i < 5; i++) {
-        uint64_t c = 0;
-#pragma unroll
-        for (int j = i + 1; j < 8 && i + j < 10; j++) {
-            uint64_t t = (uint64_t)a.v[i] * a.v[j] + r[i + j] + c;
-            r[i + j] = (uint32_t)t;
-            c = t >> 32;
-        }
-        if (i < 2) r[i + 8] = (uint32_t)c;
-    }
-#pragma unroll
-    for (int k = 9; k > 0; k--) r[k] = r[k] << 1 | r[k - 1] >> 31;
-    uint64_t c = 0;
-#pragma unroll
-    for (int i = 0; i < 5; i++) {
-        uint64_t t = (uint64_t)a.v[i] * a.v[i] + r[2 * i] + c;
-        r[2 * i] = (uint32_t)t;
-        t = (t >> 32) + r[2 * i + 1];
-        r[2 * i + 1] = (uint32_t)t;
-        c = t >> 32;
-    }
-    return ((uint64_t)r[1] << 32 | r[0]) + 38 * ((uint64_t)r[9] << 32 | r[8]);
+    const uint32_t *v = a.v;
+    uint64_t lo = (uint64_t)v[0] * v[0] + ((uint64_t)(v[0] * v[1]) << 33);
+    uint64_t c7 = (uint64_t)__umulhi(v[0], v[7]) + __umulhi(v[1], v[6]) + __umulhi(v[2], v[5]) +
+                  __umulhi(v[3], v[4]);
+    uint64_t c8 = (uint64_t)v[1] * v[7] + (uint64_t)v[2] * v[6] + (uint64_t)v[3] * v[5];
+    uint32_t c9 = v[2] * v[7] + v[3] * v[6] + v[4] * v[5];
+    uint64_t hi = 2 * (c7 + c8) + (uint64_t)v[4] * v[4] + ((uint64_t)c9 << 33);
+    return lo + 38 * hi;
 }
 
 __device__ __forceinline__ uint64_t lo64(const fe &a) { return (uint64_t)a.v[1] << 32 | a.v[0]; }
@@ -315,6 +301,7 @@ struct Matcher {
     const uint64_t *values;
     uint32_t groups;
     uint64_t chars[6];
+    uint64_t chars3_wide;  // chars[3] widened by one position either way
     uint32_t *hits;
     uint32_t max_hits;
 };
@@ -335,11 +322,15 @@ __device__ __forceinline__ void check(const Matcher &m, const fe &u, uint32_t ti
     }
 }
 
-// l is the low 64 bits of an unreduced u' = u + k p with k in [-5, 78], so the low 64 bits of u are
-// l + 19 k and bits 16.. differ from those of l by -1, 0 or 1. Characters 3..5 of the key live in
-// those bits (little-endian bits 16..21, 26..31 and 24..25 + 36..39), so this test never misses.
+// l is the low 64 bits of u + k p - 38 e with k in [-5, 78] (the unreduced u) and e in [0, 16]
+// (from sqr_low), so the low 64 bits of u are l + 19 k + 38 e, an offset in [-95, 2090], and bits
+// 16.. differ from those of l by -1, 0 or 1. Characters 3..5 of the key live in those bits
+// (little-endian bits 16..21, 26..31 and 24..25 + 36..39), so this test never misses.
 __device__ __forceinline__ bool maybe_fast(const Matcher &m, uint64_t l) {
     uint64_t h = l >> 16;
+    uint32_t c3 = h & 63, c4 = h >> 10 & 63, c5 = (h >> 8 & 3) << 4 | (h >> 20 & 15);
+    // Unless character 3 is 0 or 63, the -1/+1 cannot carry into characters 4 and 5.
+    if (c3 - 1 < 62) return m.chars3_wide >> c3 & m.chars[4] >> c4 & m.chars[5] >> c5 & 1;
     bool any = false;
 #pragma unroll
     for (int c = -1; c <= 1; c++) {
@@ -404,8 +395,9 @@ __device__ __forceinline__ void walk_body(uint32_t *state, const uint32_t *__res
 __device__ __forceinline__ Matcher matcher(const uint64_t *masks, const uint32_t *starts, const uint64_t *values,
                                            uint32_t groups, const uint64_t *chars, uint32_t *hits,
                                            uint32_t max_hits) {
-    Matcher m = {masks, starts, values, groups, {}, hits, max_hits};
+    Matcher m = {masks, starts, values, groups, {}, 0, hits, max_hits};
     for (int i = 0; i < 6; i++) m.chars[i] = chars[i];
+    m.chars3_wide = m.chars[3] << 1 | m.chars[3] | m.chars[3] >> 1;
     return m;
 }
 
