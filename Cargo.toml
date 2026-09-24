@@ -6,9 +6,12 @@ edition = "2024"
 [dependencies]
 base64 = "0.23.1"
 bpaf = { version = "0.9.28", features = ["derive"] }
+color-eyre = "0.6.5"
 cudarc = { version = "0.19.9", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-13030"] }
 curve25519-dalek = "5.0.0"
 getrandom = "0.4.3"
+human_format = "1.2.1"
+indicatif = "0.18.6"
 zeroize = "1.9.0"
 
 [profile.release]

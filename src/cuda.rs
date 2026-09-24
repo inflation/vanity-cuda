@@ -3,7 +3,7 @@ use crate::walk::{Ctx, Seed, step_point};
 use cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT;
 use cudarc::driver::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::Ptx;
-use std::error::Error;
+use color_eyre::eyre::{Result, WrapErr};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, sync_channel};
 
@@ -105,7 +105,7 @@ struct Gpu {
 }
 
 impl Gpu {
-    fn new() -> Result<Gpu, Box<dyn Error>> {
+    fn new() -> Result<Gpu> {
         let cu = CudaContext::new(0)?;
         // Sleep instead of spinning a core while waiting for each launch.
         cu.set_blocking_synchronize()?;
@@ -124,15 +124,8 @@ impl Gpu {
     }
 }
 
-pub fn worker(ctx: &Ctx) {
-    if let Err(e) = run(ctx) {
-        eprintln!("\nCUDA error: {e}");
-        std::process::exit(1);
-    }
-}
-
 /// CPU cores keep a pool of fresh lanes, so a hit only swaps one thread's center.
-fn run(ctx: &Ctx) -> Result<(), Box<dyn Error>> {
+pub fn run(ctx: &Ctx) -> Result<()> {
     let o = Orientation::new();
     let (tx, rx) = sync_channel(4096);
     std::thread::scope(|s| {
@@ -145,8 +138,8 @@ fn run(ctx: &Ctx) -> Result<(), Box<dyn Error>> {
     })
 }
 
-fn search(ctx: &Ctx, o: Orientation, lanes: Receiver<Lane>) -> Result<(), Box<dyn Error>> {
-    let gpu = Gpu::new()?;
+fn search(ctx: &Ctx, o: Orientation, lanes: Receiver<Lane>) -> Result<()> {
+    let gpu = Gpu::new().wrap_err("failed to initialize CUDA")?;
     let stream = &gpu.stream;
     let threads = gpu.threads();
     let table = stream.clone_htod(&build_table(o))?;
@@ -204,7 +197,7 @@ fn search(ctx: &Ctx, o: Orientation, lanes: Receiver<Lane>) -> Result<(), Box<dy
                 continue;
             }
             let k = launch * ITERS as u64 + it as u64 - since[t];
-            ctx.report(&owned[t].seed, k * KEYS + j as u64, (hi as u64) << 32 | lo as u64);
+            ctx.report(&owned[t].seed, k * KEYS + j as u64, (hi as u64) << 32 | lo as u64)?;
             owned[t] = lanes.recv()?;
             stream.memcpy_htod(&owned[t].center, &mut state.slice_mut(16 * t..16 * t + 16))?;
             since[t] = next;

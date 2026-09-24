@@ -1,3 +1,5 @@
+use color_eyre::eyre::{Result, bail, ensure};
+
 const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 pub const MAX_LEN: usize = 10;
 
@@ -32,17 +34,15 @@ fn variants(prefix: &str, ignore_case: bool) -> Vec<Vec<u8>> {
 }
 
 impl Matcher {
-    pub fn new(prefixes: &[String], ignore_case: bool) -> Result<Matcher, String> {
+    pub fn new(prefixes: &[String], ignore_case: bool) -> Result<Matcher> {
         let mut groups: Vec<(u64, Vec<u64>)> = vec![];
         for p in prefixes {
-            if p.is_empty() || p.len() > MAX_LEN {
-                return Err(format!("prefix {p:?} must be 1..={MAX_LEN} characters"));
-            }
+            ensure!(
+                (1..=MAX_LEN).contains(&p.len()),
+                "prefix {p:?} must be 1..={MAX_LEN} characters"
+            );
             if let Some(c) = p.bytes().find(|c| !ALPHABET.contains(c)) {
-                return Err(format!(
-                    "prefix {p:?} has non-base64 character {:?}",
-                    c as char
-                ));
+                bail!("prefix {p:?} has non-base64 character {:?}", c as char);
             }
             for v in variants(p, ignore_case) {
                 let (mask, value) = encode(&v);

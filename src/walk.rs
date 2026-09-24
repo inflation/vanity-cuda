@@ -1,5 +1,6 @@
 use crate::field::Fe;
 use crate::pattern::Matcher;
+use color_eyre::eyre::{Result, ensure};
 use curve25519_dalek::{MontgomeryPoint, Scalar, constants::X25519_BASEPOINT};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::mpsc::Sender;
@@ -63,15 +64,18 @@ impl Ctx {
     }
 
     /// Recompute the key at `off` with dalek, verify it, and report it.
-    pub fn report(&self, seed: &Seed, off: u64, prefix: u64) {
-        let Some(private) = seed.key(off) else { return };
+    pub fn report(&self, seed: &Seed, off: u64, prefix: u64) -> Result<()> {
+        let Some(private) = seed.key(off) else {
+            return Ok(());
+        };
         let public = MontgomeryPoint::mul_base_clamped(*private).to_bytes();
         let p = u64::from_be_bytes(public[..8].try_into().unwrap());
-        assert!(
+        ensure!(
             p == prefix && self.matcher.matches(p),
-            "internal error: hit failed verification"
+            "internal error: GPU hit failed verification"
         );
         let _ = self.tx.send(Hit { private, public });
+        Ok(())
     }
 }
 

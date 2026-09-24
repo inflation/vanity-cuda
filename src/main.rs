@@ -5,11 +5,15 @@ mod walk;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use bpaf::Bpaf;
+use color_eyre::eyre::{Result, eyre};
+use human_format::Formatter;
+use indicatif::{HumanDuration, ProgressBar, ProgressStyle};
 use pattern::Matcher;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use walk::Ctx;
+use zeroize::Zeroizing;
 
 /// Search for WireGuard keypairs whose base64 public key starts with a prefix.
 #[derive(Bpaf, Debug)]
@@ -26,12 +30,13 @@ struct Args {
     prefixes: Vec<String>,
 }
 
-fn main() {
+fn main() -> Result<()> {
+    color_eyre::config::HookBuilder::default()
+        .display_location_section(false)
+        .display_env_section(false)
+        .install()?;
     let args = args().run();
-    let matcher = Matcher::new(&args.prefixes, args.ignore_case).unwrap_or_else(|e| {
-        eprintln!("error: {e}");
-        std::process::exit(2);
-    });
+    let matcher = Matcher::new(&args.prefixes, args.ignore_case)?;
     let expected = 1.0 / matcher.probability();
     let (tx, rx) = mpsc::channel();
     let ctx = Ctx {
@@ -40,22 +45,26 @@ fn main() {
         stop: false.into(),
         tx,
     };
+    let bar = ProgressBar::new(1000).with_style(
+        ProgressStyle::with_template("[{bar:20}] {percent:>3}% {msg}")?.progress_chars("█░"),
+    );
+    let num = |x: f64| Formatter::new().format(x);
 
     std::thread::scope(|s| {
-        s.spawn(|| cuda::worker(&ctx));
+        let worker = s.spawn(|| cuda::run(&ctx));
         let tick = Duration::from_secs(1);
         let (start, mut found) = (Instant::now(), 0);
         let mut last = (start, 0);
-        while found < args.count {
+        while found < args.count && !worker.is_finished() {
             if let Ok(hit) = rx.recv_timeout(tick.saturating_sub(last.0.elapsed())) {
+                let private = Zeroizing::new(STANDARD.encode(*hit.private));
+                bar.suspend(|| {
+                    if found > 0 {
+                        println!("{}", "-".repeat(53));
+                    }
+                    println!("private: {}\npublic:  {}", *private, STANDARD.encode(hit.public));
+                });
                 found += 1;
-                let private = zeroize::Zeroizing::new(STANDARD.encode(*hit.private));
-                eprint!("\r\x1b[K");
-                println!(
-                    "private: {}\npublic:  {}",
-                    *private,
-                    STANDARD.encode(hit.public)
-                );
             }
             if last.0.elapsed() < tick {
                 continue;
@@ -67,52 +76,34 @@ fn main() {
                 continue;
             }
             // Expected time for all hits at the average rate so far.
-            let elapsed = (now - start).as_secs_f64();
-            let total = expected * args.count as f64 / (keys as f64 / elapsed);
-            let progress = elapsed / total;
-            eprint!(
-                "\r\x1b[K[{}] {:>3.0}% {}/{} found  {} keys/s  {} keys  {} / ~{}",
-                bar(progress, 20),
-                progress * 100.0,
-                found,
+            let elapsed = now - start;
+            let total = expected * args.count as f64 * elapsed.as_secs_f64() / keys as f64;
+            let total = Duration::try_from_secs_f64(total).unwrap_or(Duration::MAX);
+            let msg = format!(
+                "{found}/{} found  {}keys/s  {}keys  {} / ~{}",
                 args.count,
-                si(rate),
-                si(keys as f64),
-                time(elapsed),
-                time(total),
+                num(rate),
+                num(keys as f64),
+                HumanDuration(elapsed),
+                HumanDuration(total),
             );
+            let progress = elapsed.as_secs_f64() / total.as_secs_f64();
+            bar.set_position((1000.0 * progress) as u64);
+            if bar.is_hidden() {
+                eprintln!("{:.0}% {msg}", 100.0 * progress);
+            }
+            bar.set_message(msg);
         }
         ctx.stop.store(true, Relaxed);
-        let secs = start.elapsed().as_secs_f64();
-        let keys = ctx.keys.load(Relaxed) as f64;
+        bar.finish_and_clear();
+        worker.join().map_err(|_| eyre!("CUDA worker panicked"))??;
+        let (secs, keys) = (start.elapsed(), ctx.keys.load(Relaxed) as f64);
         eprintln!(
-            "\r\x1b[K{} keys at {} keys/s in {}",
-            si(keys),
-            si(keys / secs),
-            time(secs)
+            "{}keys at {}keys/s in {}",
+            num(keys),
+            num(keys / secs.as_secs_f64()),
+            HumanDuration(secs)
         );
-    });
-}
-
-fn bar(progress: f64, width: usize) -> String {
-    let filled = (progress.clamp(0.0, 1.0) * width as f64).round() as usize;
-    "█".repeat(filled) + &"░".repeat(width - filled)
-}
-
-/// Formats with a k, M, G, ... suffix.
-fn si(x: f64) -> String {
-    const UNITS: [&str; 7] = ["", "k", "M", "G", "T", "P", "E"];
-    let i = ((x.max(1.0).log10() / 3.0) as usize).min(UNITS.len() - 1);
-    format!("{:.2}{}", x / 1e3f64.powi(i as i32), UNITS[i])
-}
-
-fn time(secs: f64) -> String {
-    let s = secs.round() as u64;
-    match secs {
-        ..60.0 => format!("{s}s"),
-        ..3600.0 => format!("{}m{:02}s", s / 60, s % 60),
-        ..86400.0 => format!("{}h{:02}m", s / 3600, s / 60 % 60),
-        ..31_557_600.0 => format!("{:.1}d", secs / 86400.0),
-        _ => format!("{}y", si(secs / 31_557_600.0)),
-    }
+        Ok(())
+    })
 }
