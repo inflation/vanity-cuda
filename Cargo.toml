@@ -1,0 +1,21 @@
+[package]
+name = "vanity-cuda"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+base64 = "0.23.1"
+bpaf = { version = "0.9.28", features = ["derive"] }
+cudarc = { version = "0.19.9", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-13030"] }
+curve25519-dalek = "5.0.0"
+getrandom = "0.4.3"
+zeroize = "1.9.0"
+
+[profile.release]
+panic = "abort"
+
+[profile.test]
+opt-level = 3
+
+[build-dependencies]
+cc = "1.4.7"
