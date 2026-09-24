@@ -3,8 +3,8 @@
 
 // build.rs reads these values for src/cuda.rs.
 // Table points per batch; each thread checks 2 * BATCH + 1 keys per iteration.
-#define BATCH 512
-#define BLOCKS_PER_SM 4
+#define BATCH 128
+#define BLOCKS_PER_SM 6
 
 struct fe {
     uint32_t v[8];
@@ -187,28 +187,8 @@ __device__ __forceinline__ fe fe_sqr(const fe &a) {
     return reduce(r);
 }
 
-__device__ __noinline__ fe fe_pow2k(fe a, int k) {
-    for (int i = 0; i < k; i++) a = fe_sqr(a);
-    return a;
-}
-
-__device__ fe fe_invert(const fe &z) {
-    fe z2 = fe_sqr(z);
-    fe z9 = fe_mul(fe_pow2k(z2, 2), z);
-    fe z11 = fe_mul(z9, z2);
-    fe z5 = fe_mul(fe_sqr(z11), z9);
-    fe z10 = fe_mul(fe_pow2k(z5, 5), z5);
-    fe z20 = fe_mul(fe_pow2k(z10, 10), z10);
-    fe z40 = fe_mul(fe_pow2k(z20, 20), z20);
-    fe z50 = fe_mul(fe_pow2k(z40, 10), z10);
-    fe z100 = fe_mul(fe_pow2k(z50, 50), z50);
-    fe z200 = fe_mul(fe_pow2k(z100, 100), z100);
-    fe z250 = fe_mul(fe_pow2k(z200, 50), z50);
-    return fe_mul(fe_pow2k(z250, 5), z11);
-}
-
-// First 8 bytes of the canonical encoding, as a big-endian integer.
-__device__ __forceinline__ uint64_t fe_prefix(fe a) {
+// Canonical value in [0, p).
+__device__ __forceinline__ fe fe_canonical(fe a) {
     uint64_t c = (a.v[7] >> 31) * 19;
     a.v[7] &= 0x7fffffff;
     for (int i = 0; i < 8; i++) {
@@ -223,7 +203,148 @@ __device__ __forceinline__ uint64_t fe_prefix(fe a) {
         t.v[i] = (uint32_t)c;
         c >>= 32;
     }
-    if (t.v[7] >> 31) a = t;
+    if (t.v[7] >> 31) {
+        t.v[7] &= 0x7fffffff;
+        return t;
+    }
+    return a;
+}
+
+// Variable-time safegcd (Bernstein-Yang) inversion, ported from libsecp256k1's modinv32 for
+// p = 2^255 - 19. Values are signed 9 x 30-bit limbs; inputs are public, so variable time is fine.
+struct s30 {
+    int32_t v[9];
+};
+
+struct trans {
+    int32_t u, v, q, r;
+};
+
+#define M30 0x3fffffff
+__device__ __constant__ int32_t P30[9] = {0x3fffffed, M30, M30, M30, M30, M30, M30, M30, 0x7fff};
+#define PINV30 0x179435e5u  // p^-1 mod 2^30
+
+__device__ __forceinline__ s30 to_s30(const fe &a) {
+    s30 r;
+#pragma unroll
+    for (int i = 0; i < 9; i++) {
+        int b = 30 * i, w = b / 32, s = b % 32;
+        uint64_t x = a.v[w] >> s;
+        if (w + 1 < 8) x |= (uint64_t)a.v[w + 1] << (32 - s);
+        r.v[i] = (int32_t)(x & M30);
+    }
+    return r;
+}
+
+__device__ __forceinline__ fe from_s30(const s30 &a) {
+    fe r;
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+        int b = 32 * i, w = b / 30, s = b % 30;
+        uint64_t x = (uint64_t)(uint32_t)a.v[w] >> s | (uint64_t)(uint32_t)a.v[w + 1] << (30 - s);
+        if (w + 2 < 9) x |= (uint64_t)(uint32_t)a.v[w + 2] << (60 - s);
+        r.v[i] = (uint32_t)x;
+    }
+    return r;
+}
+
+// -f^-1 mod 256 for odd f, by Newton iteration instead of a lookup table.
+__device__ __forceinline__ uint32_t neg_inv8(uint32_t f) {
+    uint32_t x = (3 * f) ^ 2;
+    x *= 2 - f * x;
+    return -x;
+}
+
+// 30 divsteps on the low limbs of f and g; returns the new eta and the transition matrix.
+__device__ __forceinline__ int32_t divsteps_30(int32_t eta, uint32_t f, uint32_t g, trans &t) {
+    uint32_t u = 1, v = 0, q = 0, r = 1;
+    int i = 30;
+    for (;;) {
+        int zeros = __ffs(g | 0xffffffffu << i) - 1;
+        g >>= zeros, u <<= zeros, v <<= zeros, eta -= zeros, i -= zeros;
+        if (i == 0) break;
+        if (eta < 0) {
+            uint32_t tmp;
+            eta = -eta;
+            tmp = f, f = g, g = -tmp;
+            tmp = u, u = q, q = -tmp;
+            tmp = v, v = r, r = -tmp;
+        }
+        int limit = eta + 1 > i ? i : eta + 1;
+        uint32_t w = g * neg_inv8(f) & (0xffffffffu >> (32 - limit)) & 255;
+        g += f * w, q += u * w, r += v * w;
+    }
+    t = {(int32_t)u, (int32_t)v, (int32_t)q, (int32_t)r};
+    return eta;
+}
+
+// (f, g) = t (f, g) / 2^30.
+__device__ __forceinline__ void update_fg(s30 &f, s30 &g, const trans &t) {
+    int64_t cf = ((int64_t)t.u * f.v[0] + (int64_t)t.v * g.v[0]) >> 30;
+    int64_t cg = ((int64_t)t.q * f.v[0] + (int64_t)t.r * g.v[0]) >> 30;
+#pragma unroll
+    for (int i = 1; i < 9; i++) {
+        cf += (int64_t)t.u * f.v[i] + (int64_t)t.v * g.v[i];
+        cg += (int64_t)t.q * f.v[i] + (int64_t)t.r * g.v[i];
+        f.v[i - 1] = (int32_t)cf & M30, cf >>= 30;
+        g.v[i - 1] = (int32_t)cg & M30, cg >>= 30;
+    }
+    f.v[8] = (int32_t)cf, g.v[8] = (int32_t)cg;
+}
+
+// (d, e) = t (d, e) / 2^30 mod p, adding multiples of p so the division is exact.
+__device__ __forceinline__ void update_de(s30 &d, s30 &e, const trans &t) {
+    int32_t sd = d.v[8] >> 31, se = e.v[8] >> 31;
+    int32_t md = (t.u & sd) + (t.v & se), me = (t.q & sd) + (t.r & se);
+    int64_t cd = (int64_t)t.u * d.v[0] + (int64_t)t.v * e.v[0];
+    int64_t ce = (int64_t)t.q * d.v[0] + (int64_t)t.r * e.v[0];
+    md -= (PINV30 * (uint32_t)cd + md) & M30;
+    me -= (PINV30 * (uint32_t)ce + me) & M30;
+    cd = (cd + (int64_t)P30[0] * md) >> 30;
+    ce = (ce + (int64_t)P30[0] * me) >> 30;
+#pragma unroll
+    for (int i = 1; i < 9; i++) {
+        cd += (int64_t)t.u * d.v[i] + (int64_t)t.v * e.v[i] + (int64_t)P30[i] * md;
+        ce += (int64_t)t.q * d.v[i] + (int64_t)t.r * e.v[i] + (int64_t)P30[i] * me;
+        d.v[i - 1] = (int32_t)cd & M30, cd >>= 30;
+        e.v[i - 1] = (int32_t)ce & M30, ce >>= 30;
+    }
+    d.v[8] = (int32_t)cd, e.v[8] = (int32_t)ce;
+}
+
+// r (negated if sign < 0) reduced to [0, p).
+__device__ __forceinline__ fe normalize(s30 r, int32_t sign) {
+    int32_t c = r.v[8] >> 31;
+    for (int i = 0; i < 9; i++) r.v[i] += P30[i] & c;
+    c = sign >> 31;
+    for (int i = 0; i < 9; i++) r.v[i] = (r.v[i] ^ c) - c;
+    for (int i = 0; i < 8; i++) r.v[i + 1] += r.v[i] >> 30, r.v[i] &= M30;
+    c = r.v[8] >> 31;
+    for (int i = 0; i < 9; i++) r.v[i] += P30[i] & c;
+    for (int i = 0; i < 8; i++) r.v[i + 1] += r.v[i] >> 30, r.v[i] &= M30;
+    return from_s30(r);
+}
+
+__device__ fe fe_invert(const fe &x) {
+    s30 d = {}, e = {}, f, g = to_s30(fe_canonical(x));
+    e.v[0] = 1;
+    for (int i = 0; i < 9; i++) f.v[i] = P30[i];
+    int32_t eta = -1, any;
+#pragma unroll 1
+    do {
+        trans t;
+        eta = divsteps_30(eta, f.v[0], g.v[0], t);
+        update_de(d, e, t);
+        update_fg(f, g, t);
+        any = 0;
+        for (int i = 0; i < 9; i++) any |= g.v[i];
+    } while (any);
+    return normalize(d, f.v[8]);
+}
+
+// First 8 bytes of the canonical encoding, as a big-endian integer.
+__device__ __forceinline__ uint64_t fe_prefix(const fe &x) {
+    fe a = fe_canonical(x);
     return (uint64_t)__byte_perm(a.v[0], 0, 0x0123) << 32 | __byte_perm(a.v[1], 0, 0x0123);
 }
 
