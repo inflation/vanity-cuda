@@ -66,6 +66,18 @@ impl Matcher {
             .any(|(m, v)| v.binary_search(&(x & m)).is_ok())
     }
 
+    /// Bit `c` of entry `i` is set if some pattern allows base64 character `c` at position `i`.
+    pub fn char_sets(&self) -> [u64; 2] {
+        std::array::from_fn(|i| {
+            let shift = 58 - 6 * i;
+            let chars = |(m, v): &(u64, Vec<u64>)| match m >> shift & 0x3f {
+                0 => !0,
+                _ => v.iter().fold(0, |bits, v| bits | 1 << (v >> shift & 0x3f)),
+            };
+            self.groups.iter().map(chars).fold(0, |a, b| a | b)
+        })
+    }
+
     /// Probability that a random key matches.
     pub fn probability(&self) -> f64 {
         self.groups
@@ -102,6 +114,9 @@ mod tests {
         let m = Matcher::new(&["ab1".into(), "AB1".into()], true).unwrap();
         assert_eq!(m.groups.len(), 1);
         assert_eq!(m.groups[0].1.len(), 4);
+        assert_eq!(m.char_sets(), [1 << 0 | 1 << 26, 1 << 1 | 1 << 27]);
+        let m = Matcher::new(&["b".into(), "Ab".into()], false).unwrap();
+        assert_eq!(m.char_sets(), [1 << 0 | 1 << 27, !0]);
         assert!(Matcher::new(&["a-b".into()], false).is_err());
         assert!(Matcher::new(&["abcdefghijk".into()], false).is_err());
     }

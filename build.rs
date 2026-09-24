@@ -7,12 +7,14 @@ fn main() {
     println!("cargo:rerun-if-changed={KERNEL}");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     let src = std::fs::read_to_string(KERNEL).unwrap();
-    let lanes = src
-        .lines()
-        .find_map(|l| l.strip_prefix("#define LANES "))
-        .expect("kernel has no `#define LANES`")
-        .trim();
-    println!("cargo:rustc-env=VANITY_LANES={lanes}");
+    for name in ["BATCH", "BLOCKS_PER_SM"] {
+        let value = src
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("#define {name} ")))
+            .unwrap_or_else(|| panic!("kernel has no `#define {name}`"))
+            .trim();
+        println!("cargo:rustc-env=VANITY_{name}={value}");
+    }
 
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let cuda = std::env::var("CUDA_PATH").expect("CUDA_PATH is not set; install the CUDA Toolkit");

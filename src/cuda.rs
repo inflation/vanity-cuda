@@ -1,28 +1,35 @@
 use crate::field::Fe;
-use crate::walk::{Ctx, Point, Seed, chain, step_point};
+use crate::walk::{Ctx, Seed, step_point};
 use cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT;
 use cudarc::driver::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::Ptx;
 use std::error::Error;
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, sync_channel};
 
 const PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/vanity.ptx"));
-const LANES: usize = match usize::from_str_radix(env!("VANITY_LANES"), 10) {
-    Ok(n) => n,
-    Err(_) => panic!("invalid VANITY_LANES"),
-};
+const BATCH: usize = define(env!("VANITY_BATCH"));
+const BLOCKS_PER_SM: u32 = define(env!("VANITY_BLOCKS_PER_SM")) as u32;
+/// Keys each thread checks per iteration: its center and center ± i R for i in 1..=BATCH.
+const KEYS: u64 = 2 * BATCH as u64 + 1;
 const BLOCK: u32 = 128;
-/// Must match `__launch_bounds__` of `walk`; see the comment there.
-const BLOCKS_PER_SM: u32 = 1;
-const ITERS: u32 = 32;
-const MAX_HITS: u32 = 16;
+/// About 4096 keys per thread per launch keeps launches short and stop requests responsive.
+const ITERS: u32 = 1 + 4095 / KEYS as u32;
+const MAX_HITS: u32 = 1024;
+const fn define(s: &str) -> usize {
+    match usize::from_str_radix(s, 10) {
+        Ok(n) => n,
+        Err(_) => panic!("invalid kernel define"),
+    }
+}
+
 const A: Fe = Fe([486662, 0, 0, 0, 0]);
 
 /// Affine point (u, v) on v^2 = u^3 + A u^2 + u.
 type Affine = (Fe, Fe);
 
-/// The step point G = ±8B with a fixed sign of v. Lanes and Q are recovered relative to G,
-/// so the whole walk is either all of (s0 + 8j)B or all of their negations, which share u.
+/// The step point G = ±8B with a fixed sign of v. Centers and the table are recovered relative
+/// to G, so every walk is either all of (s0 + 8j)B or all of their negations, which share u.
 #[derive(Clone, Copy)]
 struct Orientation {
     g: Affine,
@@ -59,63 +66,35 @@ impl Orientation {
     }
 }
 
-fn normalize(pts: &[Point]) -> Vec<Fe> {
-    let mut acc = Vec::with_capacity(pts.len());
-    let mut a = Fe::ONE;
-    for p in pts {
-        acc.push(a);
-        a = a.mul(p.1);
-    }
-    let mut inv = a.invert();
-    let mut u = vec![Fe::ONE; pts.len()];
-    for i in (0..pts.len()).rev() {
-        u[i] = pts[i].0.mul(inv.mul(acc[i]));
-        inv = inv.mul(pts[i].1);
-    }
-    u
-}
-
-/// Affine ±(s0 + 8j)B for `j in 0..n`, split across all cores.
-fn affine_lanes(seed: &Seed, o: Orientation, n: usize) -> Vec<Affine> {
-    let chunk = n.div_ceil(std::thread::available_parallelism().map_or(1, |p| p.get()));
-    std::thread::scope(|s| {
-        let parts: Vec<_> = (0..n)
-            .step_by(chunk)
-            .map(|start| {
-                s.spawn(move || {
-                    let len = chunk.min(n - start);
-                    let u = normalize(&chain(seed, start, len + 1));
-                    (0..len)
-                        .map(|i| (u[i], o.recover(u[i], u[i + 1])))
-                        .collect::<Vec<_>>()
-                })
-            })
-            .collect();
-        parts.into_iter().flat_map(|p| p.join().unwrap()).collect()
-    })
-}
-
 fn words(f: Fe) -> [u32; 8] {
     let b = f.to_bytes();
     std::array::from_fn(|i| u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap()))
 }
 
-/// Lane `l * threads + tid` starts at ±(s0 + 8j)B, stored as word ((l * 2 + coord) * 8 + limb) * threads + tid.
-fn build_state(seed: &Seed, o: Orientation, threads: usize) -> Vec<u32> {
-    let lanes = LANES * threads;
-    let pts = affine_lanes(seed, o, lanes);
-    let mut s = vec![0u32; lanes * 16];
-    for l in 0..LANES {
-        for tid in 0..threads {
-            let (u, v) = pts[l * threads + tid];
-            for (c, f) in [u, v].into_iter().enumerate() {
-                for (i, w) in words(f).into_iter().enumerate() {
-                    s[((l * 2 + c) * 8 + i) * threads + tid] = w;
-                }
-            }
+/// Entry i < BATCH is (i + 1) G and entry BATCH is the center step KEYS * G.
+fn build_table(o: Orientation) -> Vec<u32> {
+    let steps = (1..=BATCH as u64).chain([KEYS]);
+    let pts = steps.map(|i| o.step(i));
+    pts.flat_map(|(u, v)| [words(u), words(v)]).flatten().collect()
+}
+
+/// A GPU thread's own seed and its first center ±(s0 + 8 BATCH)B as words of u then v.
+/// Key j of iteration k is s0 + 8 (k KEYS + j).
+struct Lane {
+    seed: Seed,
+    center: [u32; 16],
+}
+
+impl Lane {
+    fn new(o: Orientation) -> Lane {
+        let seed = Seed::random();
+        let (u1, u2) = (seed.u(BATCH as u64), seed.u(BATCH as u64 + 1));
+        let center = [words(u1), words(o.recover(u1, u2))].concat();
+        Lane {
+            seed,
+            center: center.try_into().unwrap(),
         }
     }
-    s
 }
 
 struct Gpu {
@@ -148,14 +127,25 @@ pub fn worker(ctx: &Ctx) {
     }
 }
 
+/// CPU cores keep a pool of fresh lanes, so a hit only swaps one thread's center.
 fn run(ctx: &Ctx) -> Result<(), Box<dyn Error>> {
+    let o = Orientation::new();
+    let (tx, rx) = sync_channel(4096);
+    std::thread::scope(|s| {
+        for _ in 0..std::thread::available_parallelism().map_or(1, |n| n.get()) {
+            let tx = tx.clone();
+            s.spawn(move || while tx.send(Lane::new(o)).is_ok() {});
+        }
+        drop(tx);
+        search(ctx, o, rx)
+    })
+}
+
+fn search(ctx: &Ctx, o: Orientation, lanes: Receiver<Lane>) -> Result<(), Box<dyn Error>> {
     let gpu = Gpu::new()?;
     let stream = &gpu.stream;
     let threads = gpu.threads();
-    let lanes = (LANES * threads) as u64;
-    let o = Orientation::new();
-    let (qu, qv) = o.step(lanes);
-    let q = stream.clone_htod(&[words(qu), words(qv)].concat())?;
+    let table = stream.clone_htod(&build_table(o))?;
     let groups = &ctx.matcher.groups;
     let masks = stream.clone_htod(&groups.iter().map(|g| g.0).collect::<Vec<_>>())?;
     let values: Vec<u64> = groups.iter().flat_map(|g| g.1.iter().copied()).collect();
@@ -167,6 +157,7 @@ fn run(ctx: &Ctx) -> Result<(), Box<dyn Error>> {
         .collect();
     let (values, starts) = (stream.clone_htod(&values)?, stream.clone_htod(&starts)?);
     let (n_groups, max_hits, iters) = (groups.len() as u32, MAX_HITS, ITERS);
+    let [first_chars, second_chars] = ctx.matcher.char_sets();
     let mut hits = stream.alloc_zeros::<u32>(1 + 5 * MAX_HITS as usize)?;
     let cfg = LaunchConfig {
         grid_dim: (gpu.blocks, 1, 1),
@@ -174,42 +165,46 @@ fn run(ctx: &Ctx) -> Result<(), Box<dyn Error>> {
         shared_mem_bytes: 0,
     };
 
-    let prepare = || {
-        std::thread::spawn(move || {
-            let seed = Seed::random();
-            let state = build_state(&seed, o, threads);
-            (seed, state)
-        })
-    };
-    let mut next = prepare();
-    while !ctx.done() {
-        let (seed, state) = next.join().expect("state builder panicked");
-        next = prepare();
-        let mut state = stream.clone_htod(&state)?;
-        for launch in 0u64.. {
-            if ctx.done() {
-                return Ok(());
-            }
-            let mut b = stream.launch_builder(&gpu.walk);
-            b.arg(&mut state)
-                .arg(&q)
-                .arg(&masks)
-                .arg(&starts)
-                .arg(&values)
-                .arg(&n_groups);
-            b.arg(&mut hits).arg(&max_hits).arg(&iters);
-            unsafe { b.launch(cfg) }?;
-            let h = stream.clone_dtoh(&hits)?;
-            ctx.count(lanes * ITERS as u64);
-            if h[0] > 0 {
-                let [tid, l, it, hi, lo] = h[1..6].try_into().unwrap();
-                let j = l as u64 * threads as u64 + tid as u64;
-                let k = launch * ITERS as u64 + it as u64 + 1;
-                ctx.report(&seed, j + lanes * k, (hi as u64) << 32 | lo as u64);
-                stream.memset_zeros(&mut hits)?;
-                break;
-            }
+    let mut owned: Vec<Lane> = lanes.iter().take(threads).collect();
+    let centers: Vec<u32> = owned.iter().flat_map(|l| l.center).collect();
+    let mut state = stream.clone_htod(&centers)?;
+    // Iteration at which each thread's current lane started.
+    let mut since = vec![0u64; threads];
+    for launch in 0u64.. {
+        if ctx.done() {
+            break;
         }
+        let mut b = stream.launch_builder(&gpu.walk);
+        b.arg(&mut state)
+            .arg(&table)
+            .arg(&masks)
+            .arg(&starts)
+            .arg(&values)
+            .arg(&n_groups)
+            .arg(&first_chars)
+            .arg(&second_chars);
+        b.arg(&mut hits).arg(&max_hits).arg(&iters);
+        unsafe { b.launch(cfg) }?;
+        let h = stream.clone_dtoh(&hits)?;
+        ctx.count(threads as u64 * KEYS * ITERS as u64);
+        if h[0] == 0 {
+            continue;
+        }
+        // Report at most one key per lane, then give that thread a fresh, unrelated lane.
+        let next = (launch + 1) * ITERS as u64;
+        let records = h[1..].as_chunks().0.iter().take(h[0].min(MAX_HITS) as usize);
+        for &[tid, j, it, hi, lo] in records {
+            let t = tid as usize;
+            if since[t] == next {
+                continue;
+            }
+            let k = launch * ITERS as u64 + it as u64 - since[t];
+            ctx.report(&owned[t].seed, k * KEYS + j as u64, (hi as u64) << 32 | lo as u64);
+            owned[t] = lanes.recv()?;
+            stream.memcpy_htod(&owned[t].center, &mut state.slice_mut(16 * t..16 * t + 16))?;
+            since[t] = next;
+        }
+        stream.memset_zeros(&mut hits)?;
     }
     Ok(())
 }
@@ -238,16 +233,18 @@ mod tests {
 
     #[test]
     fn affine_step_matches_dalek() {
-        let (o, seed, n) = (Orientation::new(), Seed::random(), 40u64);
-        let pts = affine_lanes(&seed, o, 100);
-        let q = o.step(n);
-        assert!(on_curve(o.g) && on_curve(q));
-        for (j, &(u, v)) in pts.iter().enumerate() {
-            assert_eq!(u.to_bytes(), u_of(&seed, j as u64));
+        let o = Orientation::new();
+        assert!(on_curve(o.g));
+        for n in [1, 40, KEYS] {
+            let q = o.step(n);
+            assert!(on_curve(q));
+            let lane = Lane::new(o);
+            let (u, v) = (from_words(&lane.center[..8]), from_words(&lane.center[8..]));
+            assert_eq!(u.to_bytes(), u_of(&lane.seed, BATCH as u64));
             assert!(on_curve((u, v)));
             let lambda = q.1.sub(v).mul(q.0.sub(u).invert());
             let u3 = lambda.sqr().sub(A).sub(u).sub(q.0);
-            assert_eq!(u3.to_bytes(), u_of(&seed, j as u64 + n));
+            assert_eq!(u3.to_bytes(), u_of(&lane.seed, BATCH as u64 + n));
         }
     }
 
@@ -273,12 +270,16 @@ mod tests {
         w[8..16].fill(!0);
         w[16..24].copy_from_slice(&[0xffffffee, !0, !0, !0, !0, !0, !0, 0x7fffffff]);
         w[24..32].fill(!0);
+        w[32..40].fill(0);
+        let b0 = 8 * n as usize;
+        w[b0 + 8..b0 + 16].fill(!0);
+        w[b0 + 32..b0 + 40].copy_from_slice(&[0, 1, 0, 0, 0, 0, 0, 0]);
         let (a, b) = w.split_at(8 * n as usize);
         let (da, db) = (
             gpu.stream.clone_htod(a).unwrap(),
             gpu.stream.clone_htod(b).unwrap(),
         );
-        let mut out = gpu.stream.alloc_zeros::<u32>(34 * n as usize).unwrap();
+        let mut out = gpu.stream.alloc_zeros::<u32>(42 * n as usize).unwrap();
         let mut l = gpu.stream.launch_builder(&f);
         l.arg(&da).arg(&db).arg(&mut out).arg(&n);
         let cfg = LaunchConfig {
@@ -293,7 +294,7 @@ mod tests {
                 from_words(&a[8 * i..8 * i + 8]),
                 from_words(&b[8 * i..8 * i + 8]),
             );
-            let o = &out[34 * i..34 * i + 34];
+            let o = &out[42 * i..42 * i + 42];
             assert_eq!(
                 from_words(&o[..8]).to_bytes(),
                 x.mul(y).to_bytes(),
@@ -317,7 +318,12 @@ mod tests {
                 );
             }
             assert_eq!(
-                (o[32] as u64) << 32 | o[33] as u64,
+                from_words(&o[32..40]).to_bytes(),
+                x.sqr().to_bytes(),
+                "sqr {i}"
+            );
+            assert_eq!(
+                (o[40] as u64) << 32 | o[41] as u64,
                 x.prefix(),
                 "prefix {i}"
             );
@@ -329,11 +335,11 @@ mod tests {
         let gpu = Gpu::new().unwrap();
         let stream = &gpu.stream;
         let (blocks, threads) = (2u32, 2 * BLOCK as usize);
-        let lanes = (LANES * threads) as u64;
-        let (o, seed) = (Orientation::new(), Seed::random());
-        let mut state = stream.clone_htod(&build_state(&seed, o, threads)).unwrap();
-        let (qu, qv) = o.step(lanes);
-        let q = stream.clone_htod(&[words(qu), words(qv)].concat()).unwrap();
+        let o = Orientation::new();
+        let lanes: Vec<Lane> = (0..threads).map(|_| Lane::new(o)).collect();
+        let centers: Vec<u32> = lanes.iter().flat_map(|l| l.center).collect();
+        let mut state = stream.clone_htod(&centers).unwrap();
+        let table = stream.clone_htod(&build_table(o)).unwrap();
         let m = crate::pattern::Matcher::new(&["A".into(), "wg".into()], false).unwrap();
         let masks = stream
             .clone_htod(&m.groups.iter().map(|g| g.0).collect::<Vec<_>>())
@@ -343,17 +349,20 @@ mod tests {
             .clone_htod(&[0, m.groups[0].1.len() as u32, values.len() as u32])
             .unwrap();
         let values = stream.clone_htod(&values).unwrap();
-        let mut hits = stream
-            .alloc_zeros::<u32>(1 + 5 * MAX_HITS as usize)
-            .unwrap();
-        let (groups, max_hits, iters) = (2u32, MAX_HITS, 3u32);
+        let (groups, iters) = (2u32, 3u32);
+        let [first_chars, second_chars] = m.char_sets();
+        let expect = threads as u64 * KEYS * iters as u64 / 64;
+        let max_hits = 2 * expect as u32;
+        let mut hits = stream.alloc_zeros::<u32>(1 + 5 * max_hits as usize).unwrap();
         let mut b = stream.launch_builder(&gpu.walk);
         b.arg(&mut state)
-            .arg(&q)
+            .arg(&table)
             .arg(&masks)
             .arg(&starts)
             .arg(&values)
-            .arg(&groups);
+            .arg(&groups)
+            .arg(&first_chars)
+            .arg(&second_chars);
         b.arg(&mut hits).arg(&max_hits).arg(&iters);
         let cfg = LaunchConfig {
             grid_dim: (blocks, 1, 1),
@@ -363,32 +372,26 @@ mod tests {
         unsafe { b.launch(cfg) }.unwrap();
 
         let h = stream.clone_dtoh(&hits).unwrap();
-        assert!(h[0] as u64 > lanes * 3 / 128, "too few hits: {}", h[0]);
-        for r in h[1..]
-            .as_chunks::<5>()
-            .0
-            .iter()
-            .take(h[0].min(MAX_HITS) as usize)
-        {
-            let off = r[1] as u64 * threads as u64 + r[0] as u64 + lanes * (r[2] as u64 + 1);
-            let prefix = u64::from_be_bytes(u_of(&seed, off)[..8].try_into().unwrap());
+        assert!(h[0] as u64 > expect / 2 && h[0] <= max_hits, "hits: {}", h[0]);
+        let mut sides = [false; 2];
+        for r in h[1..].as_chunks::<5>().0.iter().take(h[0] as usize) {
+            let seed = &lanes[r[0] as usize].seed;
+            let off = r[2] as u64 * KEYS + r[1] as u64;
+            let prefix = u64::from_be_bytes(u_of(seed, off)[..8].try_into().unwrap());
             assert_eq!((r[3] as u64) << 32 | r[4] as u64, prefix);
             assert!(m.matches(prefix));
+            sides[(r[1] as usize > BATCH) as usize] = true;
         }
+        assert_eq!(sides, [true; 2]);
 
         let s = stream.clone_dtoh(&state).unwrap();
-        let get = |l: usize, c: usize, tid: usize| {
-            let w: Vec<u32> = (0..8)
-                .map(|i| s[((l * 2 + c) * 8 + i) * threads + tid])
-                .collect();
-            from_words(&w)
+        let get = |c: usize, tid: usize| {
+            from_words(&s[tid * 16 + c * 8..tid * 16 + c * 8 + 8])
         };
-        for (l, tid) in [(0, 0), (5, 17), (LANES - 1, threads - 1)] {
-            let p = (get(l, 0, tid), get(l, 1, tid));
-            assert_eq!(
-                p.0.to_bytes(),
-                u_of(&seed, (l * threads + tid) as u64 + lanes * 3)
-            );
+        for tid in [0, 17, threads - 1] {
+            let p = (get(0, tid), get(1, tid));
+            let center = iters as u64 * KEYS + BATCH as u64;
+            assert_eq!(p.0.to_bytes(), u_of(&lanes[tid].seed, center));
             assert!(on_curve(p));
         }
     }

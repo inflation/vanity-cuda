@@ -5,9 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::mpsc::Sender;
 use zeroize::Zeroizing;
 
-pub type Point = (Fe, Fe);
-
-/// Random clamped base scalar; key `i` of a walk is `s0 + 8i`.
+/// Random clamped base scalar; key `i` of a lane is `s0 + 8i`.
 pub struct Seed(Zeroizing<[u8; 32]>);
 
 impl Seed {
@@ -31,39 +29,16 @@ impl Seed {
         (k[31] & 0xc0 == 0x40).then_some(k)
     }
 
-    fn point(&self, off: u64) -> Point {
+    /// Affine u of the public key at `off`.
+    pub fn u(&self, off: u64) -> Fe {
         let k = self.key(off).expect("seed offset overflow");
-        (
-            Fe::from_bytes(&MontgomeryPoint::mul_base_clamped(*k).to_bytes()),
-            Fe::ONE,
-        )
+        Fe::from_bytes(&MontgomeryPoint::mul_base_clamped(*k).to_bytes())
     }
 }
 
 /// Affine u coordinate of `8n * B`.
 pub fn step_point(n: u64) -> Fe {
     Fe::from_bytes(&(X25519_BASEPOINT * Scalar::from(8 * n)).to_bytes())
-}
-
-/// Differential addition `p + q` given `d = p - q` and `qp = u(q) + 1`, `qm = u(q) - 1`.
-#[inline(always)]
-pub fn xadd(p: Point, d: Point, qp: Fe, qm: Fe) -> Point {
-    let u = p.0.sub(p.1).mul(qp);
-    let v = p.0.add(p.1).mul(qm);
-    (d.1.mul(u.add(v).sqr()), d.0.mul(u.sub(v).sqr()))
-}
-
-/// Projective points `(s0 + 8m) * B` for `m in start..start + n`.
-pub fn chain(seed: &Seed, start: usize, n: usize) -> Vec<Point> {
-    let g = step_point(1);
-    let (gp, gm) = (g.add(Fe::ONE), g.sub(Fe::ONE));
-    let mut c = vec![seed.point(start as u64), seed.point(start as u64 + 1)];
-    while c.len() < n {
-        let m = c.len();
-        c.push(xadd(c[m - 1], c[m - 2], gp, gm));
-    }
-    c.truncate(n);
-    c
 }
 
 pub struct Hit {
@@ -103,15 +78,6 @@ impl Ctx {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn chain_matches_dalek() {
-        let seed = Seed::random();
-        for (m, p) in chain(&seed, 7, 20).into_iter().enumerate() {
-            let expect = MontgomeryPoint::mul_base_clamped(*seed.key(m as u64 + 7).unwrap());
-            assert_eq!(p.0.mul(p.1.invert()).to_bytes(), expect.to_bytes());
-        }
-    }
 
     #[test]
     fn key_stays_clamped() {
